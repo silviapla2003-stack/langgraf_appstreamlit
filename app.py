@@ -2,9 +2,7 @@ import os
 import streamlit as st
 from typing import Annotated, TypedDict, List, Any
 
-from langgraph.graph.message import add_messages
 from langgraph.graph import END, StateGraph
-
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -12,10 +10,17 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 
 
 # -----------------------------
+# Reducer (sin depender de imports internos de LangGraph)
+# -----------------------------
+def add_messages(existing: List[Any] | None, new: List[Any] | None) -> List[Any]:
+    return (existing or []) + (new or [])
+
+
+# -----------------------------
 # Helpers
 # -----------------------------
 def msg_to_text(msg) -> str:
-    """Gemini a veces devuelve content como lista de parts. Esto lo normaliza a texto."""
+    """Normaliza la salida de Gemini (a veces devuelve lista de parts)."""
     content = getattr(msg, "content", "")
     if isinstance(content, str):
         return content
@@ -31,14 +36,8 @@ def msg_to_text(msg) -> str:
 
 
 def get_secret_or_env(key: str, default: str = "") -> str:
-    """
-    Lee key desde:
-    - st.secrets (si existe secrets.toml / secrets de Cloud)
-    - env vars
-    Sin crashear si NO hay secrets configurados (tu error actual).
-    """
+    """Lee secrets si existen, si no, env. Nunca crashea si no hay secrets."""
     try:
-        # Si no existen secrets, esta línea puede disparar StreamlitSecretNotFoundError
         return st.secrets.get(key, os.getenv(key, default))
     except Exception:
         return os.getenv(key, default)
@@ -58,16 +57,9 @@ with st.sidebar:
     st.divider()
     show_steps = st.toggle("Mostrar pasos intermedios", value=False)
 
-# Auto-relleno robusto:
-# 1) lo que mete el usuario
-# 2) secrets (si existen)
-# 3) env vars
+# Prioridad: input usuario > secrets/env
 google_key = google_key_input or get_secret_or_env("GOOGLE_API_KEY", "")
 tavily_key = tavily_key_input or get_secret_or_env("TAVILY_API_KEY", "")
-
-# Feedback visual si faltan keys (sin crashear)
-if not google_key or not tavily_key:
-    st.warning("Introduce tu Google API Key y tu Tavily API Key en la barra lateral para poder generar el artículo.")
 
 
 # -----------------------------
@@ -78,7 +70,7 @@ class AgentState(TypedDict):
 
 
 # -----------------------------
-# Prompts (más “mandones”)
+# Prompts
 # -----------------------------
 outliner_prompt = ChatPromptTemplate.from_messages(
     [
@@ -103,7 +95,8 @@ writer_prompt = ChatPromptTemplate.from_messages(
             "- No preguntes al usuario.\n"
             "- No digas 'no puedo' ni disclaimers.\n"
             "- Integra datos/ideas de los resultados de búsqueda.\n"
-            "- Tono divulgativo para negocio."
+            "- Tono divulgativo para negocio.\n"
+            "- Si hay incertidumbre, formula como 'según análisis y reportes recientes' en vez de negarte."
         ),
         MessagesPlaceholder(variable_name="messages"),
     ]
@@ -114,13 +107,10 @@ writer_prompt = ChatPromptTemplate.from_messages(
 # Nodes
 # -----------------------------
 def tavily_node(state: AgentState):
-    # Forzamos búsqueda SIEMPRE
-    user_text = msg_to_text(state["messages"][0])
+    user_text = msg_to_text(state["messages"][0]).strip()
 
-    tavily = TavilySearchResults(max_results=6)
-
-    # Tavily espera {"query": "..."}
-    results = tavily.invoke({"query": user_text})
+    search_tool = TavilySearchResults(max_results=6)
+    results = search_tool.invoke({"query": user_text})
 
     return {
         "messages": [
@@ -147,7 +137,6 @@ def build_graph(google_api_key: str, tavily_api_key: str):
     if not google_api_key or not tavily_api_key:
         raise ValueError("Debes introducir Google API Key y Tavily API Key en la barra lateral.")
 
-    # Las librerías leen estas env vars
     os.environ["GOOGLE_API_KEY"] = google_api_key
     os.environ["TAVILY_API_KEY"] = tavily_api_key
 
@@ -169,13 +158,23 @@ def build_graph(google_api_key: str, tavily_api_key: str):
 # -----------------------------
 prompt = st.text_area(
     "¿Qué artículo quieres generar?",
-    value="Tendencias clave de la IA en negocios para 2026 (enfoque estrategia, casos de uso, riesgos y oportunidades).",
+    value="",          # <-- VACÍO como pediste
     height=150,
+    placeholder="Ej: 'Tendencias de IA en retail para 2026: riesgos, oportunidades, casos de uso, 800 palabras, tono business.'"
 )
 
 run = st.button("🚀 Generar artículo", type="primary")
 
+# Validaciones sin crashear
 if run:
+    if not google_key or not tavily_key:
+        st.error("Faltan las API keys. Mételas en la barra lateral (Google y Tavily).")
+        st.stop()
+
+    if not prompt.strip():
+        st.error("Escribe el tema/instrucciones del artículo antes de generar.")
+        st.stop()
+
     try:
         graph = build_graph(google_key, tavily_key)
 
